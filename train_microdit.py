@@ -32,11 +32,25 @@ if __name__ == "__main__":
 
     world_size = torch.cuda.device_count()
 
-    vae = AutoencoderKL.from_pretrained(f"{VAE_HF_NAME}", cache_dir=f"{MODELS_DIR_BASE}/vae")
-    model = MicroDiT(input_dim, patch_size, embed_dim, num_layers, 
-                    num_heads, mlp_dim, caption_embed_dim, timestep_caption_embed_dim,
-                    pos_embed_dim, num_experts, active_experts,
-                    dropout, patch_mixer_layers, embed_cat)
+    vae = AutoencoderKL.from_pretrained(
+        f"{VAE_HF_NAME}", cache_dir=f"{MODELS_DIR_BASE}/vae"
+    )
+    model = MicroDiT(
+        input_dim,
+        patch_size,
+        embed_dim,
+        num_layers,
+        num_heads,
+        mlp_dim,
+        caption_embed_dim,
+        timestep_caption_embed_dim,
+        pos_embed_dim,
+        num_experts,
+        active_experts,
+        dropout,
+        patch_mixer_layers,
+        embed_cat,
+    )
 
     print("Number of parameters: ", sum(p.numel() for p in model.parameters()))
 

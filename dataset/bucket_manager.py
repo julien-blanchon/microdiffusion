@@ -109,11 +109,29 @@ import pickle
 import time
 import json
 
+
 def get_prng(seed):
     return np.random.RandomState(seed)
 
+
 class BucketManager:
-    def __init__(self, bucket_file, valid_ids=None, max_size=(512,512), divisible=16, step_size=8, min_dim=256, base_res=(512,512), bsz=64, world_size=1, global_rank=0, max_ar_error=4, seed=42, dim_limit=1024, debug=False):
+    def __init__(
+        self,
+        bucket_file: str,
+        valid_ids: set[int] | None = None,
+        max_size: int | tuple[int, int] = (512, 512),
+        divisible: int = 16,
+        step_size: int = 8,
+        min_dim: int = 256,
+        base_res: int | tuple[int, int] = (512, 512),
+        bsz: int = 64,
+        world_size: int = 1,
+        global_rank: int = 0,
+        max_ar_error: int = 4,
+        seed: int = 42,
+        dim_limit: int = 1024,
+        debug: bool = False,
+    ):
         with open(bucket_file, "r") as fh:
             self.res_map = json.load(fh)
         if valid_ids is not None:
@@ -125,18 +143,26 @@ class BucketManager:
             self.res_map = new_res_map
         self.max_size = max_size
         self.f = 8
-        self.max_tokens = (max_size[0]/self.f) * (max_size[1]/self.f)
+        self.max_tokens = (
+            (max_size[0] / self.f) * (max_size[1] / self.f)
+            if isinstance(max_size, tuple)
+            else (max_size / self.f) ** 2
+        )
         self.div = divisible
         self.min_dim = min_dim
         self.dim_limit = dim_limit
-        self.base_res = base_res
+        self.base_res = (
+            base_res if isinstance(base_res, tuple) else (base_res, base_res)
+        )
         self.bsz = bsz
         self.world_size = world_size
         self.global_rank = global_rank
         self.max_ar_error = max_ar_error
         self.prng = get_prng(seed)
-        epoch_seed = self.prng.tomaxint() % (2**32-1)
-        self.epoch_prng = get_prng(epoch_seed) # separate prng for sharding use for increased thread resilience
+        epoch_seed = self.prng.tomaxint() % (2**32 - 1)
+        self.epoch_prng = get_prng(
+            epoch_seed
+        )  # separate prng for sharding use for increased thread resilience
         self.epoch = None
         self.left_over = {}
         self.batch_total = None
@@ -144,6 +170,7 @@ class BucketManager:
 
         self.debug = debug
 
+        self.buckets: dict[int, list[int]] = {}
         self.gen_buckets()
         self.assign_buckets()
         self.start_epoch()
@@ -151,13 +178,17 @@ class BucketManager:
     def gen_buckets(self):
         if self.debug:
             timer = time.perf_counter()
-        resolutions = []
-        aspects = []
+        resolutions: list[tuple[int, int]] = []
+        aspects: list[float] = []
         w = self.min_dim
-        while (w/self.f) * (self.min_dim/self.f) <= self.max_tokens and w <= self.dim_limit:
+        while (w / self.f) * (
+            self.min_dim / self.f
+        ) <= self.max_tokens and w <= self.dim_limit:
             h = self.min_dim
             got_base = False
-            while (w/self.f) * ((h+self.div)/self.f) <= self.max_tokens and (h+self.div) <= self.dim_limit:
+            while (w / self.f) * ((h + self.div) / self.f) <= self.max_tokens and (
+                h + self.div
+            ) <= self.dim_limit:
                 if w == self.base_res[0] and h == self.base_res[1]:
                     got_base = True
                 h += self.div
@@ -165,23 +196,29 @@ class BucketManager:
                 resolutions.append(self.base_res)
                 aspects.append(1)
             resolutions.append((w, h))
-            aspects.append(float(w)/float(h))
+            aspects.append(float(w) / float(h))
             w += self.div
         h = self.min_dim
-        while (h/self.f) * (self.min_dim/self.f) <= self.max_tokens and h <= self.dim_limit:
+        while (h / self.f) * (
+            self.min_dim / self.f
+        ) <= self.max_tokens and h <= self.dim_limit:
             w = self.min_dim
             got_base = False
-            while (h/self.f) * ((w+self.div)/self.f) <= self.max_tokens and (w+self.div) <= self.dim_limit:
+            while (h / self.f) * ((w + self.div) / self.f) <= self.max_tokens and (
+                w + self.div
+            ) <= self.dim_limit:
                 if w == self.base_res[0] and h == self.base_res[1]:
                     got_base = True
                 w += self.div
             resolutions.append((w, h))
-            aspects.append(float(w)/float(h))
+            aspects.append(float(w) / float(h))
             h += self.div
-        res_map = {}
+        res_map: dict[tuple[int, int], float] = {}
         for i, res in enumerate(resolutions):
             res_map[res] = aspects[i]
-        self.resolutions = sorted(res_map.keys(), key=lambda x: x[0] * 4096 - x[1])
+        self.resolutions: list[tuple[int, int]] = sorted(
+            res_map.keys(), key=lambda x: x[0] * 4096 - x[1]
+        )
         self.aspects = np.array(list(map(lambda x: res_map[x], self.resolutions)))
         self.resolutions = np.array(self.resolutions)
         if self.debug:
@@ -193,21 +230,21 @@ class BucketManager:
     def assign_buckets(self):
         if self.debug:
             timer = time.perf_counter()
-        self.buckets = {}
-        self.aspect_errors = []
+        self.buckets: dict[int, list[int]] = {}
+        _aspect_errors: list[float] = []
         skipped = 0
         skip_list = []
         for post_id in self.res_map.keys():
             w, h = self.res_map[post_id]
-            aspect = float(w)/float(h)
-            bucket_id = np.abs(np.log(self.aspects) - np.log(aspect)).argmin()
+            aspect = float(w) / float(h)
+            bucket_id = int(np.argmin(np.abs(np.log(self.aspects) - np.log(aspect))))
             if bucket_id not in self.buckets:
                 self.buckets[bucket_id] = []
             error = abs(self.aspects[bucket_id] - aspect)
             if error < self.max_ar_error:
                 self.buckets[bucket_id].append(post_id)
                 if self.debug:
-                    self.aspect_errors.append(error)
+                    _aspect_errors.append(error)
             else:
                 skipped += 1
                 skip_list.append(post_id)
@@ -215,14 +252,22 @@ class BucketManager:
             del self.res_map[post_id]
         if self.debug:
             timer = time.perf_counter() - timer
-            self.aspect_errors = np.array(self.aspect_errors)
+            self.aspect_errors: np.ndarray = np.array(_aspect_errors)
             print(f"skipped images: {skipped}")
-            print(f"aspect error: mean {self.aspect_errors.mean()}, median {np.median(self.aspect_errors)}, max {self.aspect_errors.max()}")
-            for bucket_id in reversed(sorted(self.buckets.keys(), key=lambda b: len(self.buckets[b]))):
-                print(f"bucket {bucket_id}: {self.resolutions[bucket_id]}, aspect {self.aspects[bucket_id]:.5f}, entries {len(self.buckets[bucket_id])}")
+            print(
+                f"aspect error: mean {self.aspect_errors.mean()}, median {np.median(self.aspect_errors)}, max {self.aspect_errors.max()}"
+            )
+            for bucket_id in reversed(
+                sorted(self.buckets.keys(), key=lambda b: len(self.buckets[b]))
+            ):
+                print(
+                    f"bucket {bucket_id}: {self.resolutions[bucket_id]}, aspect {self.aspects[bucket_id]:.5f}, entries {len(self.buckets[bucket_id])}"
+                )
             print(f"assign_buckets: {timer:.5f}s")
 
-    def start_epoch(self, world_size=None, global_rank=None):
+    def start_epoch(
+        self, world_size: int | None = None, global_rank: int | None = None
+    ):
         if self.debug:
             timer = time.perf_counter()
         if world_size is not None:
@@ -234,11 +279,11 @@ class BucketManager:
         index = np.array(sorted(list(self.res_map.keys())))
         index_len = index.shape[0]
         index = self.epoch_prng.permutation(index)
-        index = index[:index_len - (index_len % (self.bsz * self.world_size))]
-        #print("perm", self.global_rank, index[0:16])
-        index = index[self.global_rank::self.world_size]
+        index = index[: index_len - (index_len % (self.bsz * self.world_size))]
+        # print("perm", self.global_rank, index[0:16])
+        index = index[self.global_rank :: self.world_size]
         self.batch_total = index.shape[0] // self.bsz
-        assert(index.shape[0] % self.bsz == 0)
+        assert index.shape[0] % self.bsz == 0
         index = set(index)
 
         self.epoch = {}
@@ -246,7 +291,14 @@ class BucketManager:
         self.batch_delivered = 0
         for bucket_id in sorted(self.buckets.keys()):
             if len(self.buckets[bucket_id]) > 0:
-                self.epoch[bucket_id] = np.array([post_id for post_id in self.buckets[bucket_id] if post_id in index], dtype=np.int64)
+                self.epoch[bucket_id] = np.array(
+                    [
+                        post_id
+                        for post_id in self.buckets[bucket_id]
+                        if post_id in index
+                    ],
+                    dtype=np.int64,
+                )
                 self.prng.shuffle(self.epoch[bucket_id])
                 self.epoch[bucket_id] = list(self.epoch[bucket_id])
                 overhang = len(self.epoch[bucket_id]) % self.bsz
@@ -261,7 +313,9 @@ class BucketManager:
             count = 0
             for bucket_id in self.epoch.keys():
                 count += len(self.epoch[bucket_id])
-            print(f"correct item count: {count == len(index)} ({count} of {len(index)})")
+            print(
+                f"correct item count: {count == len(index)} ({count} of {len(index)})"
+            )
             print(f"start_epoch: {timer:.5f}s")
 
     def get_batch(self):
@@ -269,16 +323,20 @@ class BucketManager:
             timer = time.perf_counter()
         if self.epoch is None or self.batch_total == self.batch_delivered:
             self.start_epoch()
+            assert self.epoch is not None
 
         found_batch = False
         batch_data = None
         resolution = self.base_res
+        bucket_probs = []
         while not found_batch:
             bucket_ids = list(self.epoch.keys())
             bucket_probs = [len(self.epoch[bucket_id]) for bucket_id in bucket_ids]
 
             left_over_bucket_ids = list(self.left_over.keys())
-            left_over_bucket_probs = [len(self.left_over[bucket_id]) for bucket_id in left_over_bucket_ids]
+            left_over_bucket_probs = [
+                len(self.left_over[bucket_id]) for bucket_id in left_over_bucket_ids
+            ]
 
             all_bucket_ids = bucket_ids + left_over_bucket_ids
             all_bucket_probs = bucket_probs + left_over_bucket_probs
@@ -296,8 +354,8 @@ class BucketManager:
 
             if chosen_id in self.epoch:
                 if len(self.epoch[chosen_id]) >= self.bsz:
-                    batch_data = self.epoch[chosen_id][:self.bsz]
-                    self.epoch[chosen_id] = self.epoch[chosen_id][self.bsz:]
+                    batch_data = self.epoch[chosen_id][: self.bsz]
+                    self.epoch[chosen_id] = self.epoch[chosen_id][self.bsz :]
                     resolution = tuple(self.resolutions[chosen_id])
                     found_batch = True
                     if len(self.epoch[chosen_id]) == 0:
@@ -307,8 +365,8 @@ class BucketManager:
                     del self.epoch[chosen_id]
             elif chosen_id in self.left_over:
                 if len(self.left_over[chosen_id]) >= self.bsz:
-                    batch_data = self.left_over[chosen_id][:self.bsz]
-                    self.left_over[chosen_id] = self.left_over[chosen_id][self.bsz:]
+                    batch_data = self.left_over[chosen_id][: self.bsz]
+                    self.left_over[chosen_id] = self.left_over[chosen_id][self.bsz :]
                     resolution = tuple(self.resolutions[chosen_id])
                     found_batch = True
                     if len(self.left_over[chosen_id]) == 0:
@@ -322,7 +380,10 @@ class BucketManager:
 
         if self.debug:
             timer = time.perf_counter() - timer
-            print(f"bucket probs: " + ", ".join(map(lambda x: f"{x:.2f}", list(bucket_probs*100))))
+            print(
+                "bucket probs: "
+                + ", ".join(map(lambda x: f"{x:.2f}", list(bucket_probs * 100)))
+            )
             print(f"chosen id: {chosen_id}")
             print(f"batch data: {batch_data}")
             print(f"resolution: {resolution}")
@@ -337,6 +398,7 @@ class BucketManager:
         while self.batch_delivered < self.batch_total:
             yield self.get_batch()
 
+
 if __name__ == "__main__":
     # prepare a pickle with mapping of dataset IDs to resolutions called resolutions.pkl to use this
     with open("resolutions.pkl", "rb") as fh:
@@ -347,16 +409,20 @@ if __name__ == "__main__":
     for i, post_id in enumerate(ids):
         id_map[post_id] = i
 
-    bm = BucketManager("resolutions.pkl", debug=True, bsz=8, world_size=8, global_rank=3)
-    print("got: " + str(bm.get_batch()))
-    print("got: " + str(bm.get_batch()))
-    print("got: " + str(bm.get_batch()))
-    print("got: " + str(bm.get_batch()))
-    print("got: " + str(bm.get_batch()))
-    print("got: " + str(bm.get_batch()))
-    print("got: " + str(bm.get_batch()))
+    bm = BucketManager(
+        "resolutions.pkl", debug=True, bsz=8, world_size=8, global_rank=3
+    )
+    print(f"got: {bm.get_batch()}")
+    print(f"got: {bm.get_batch()}")
+    print(f"got: {bm.get_batch()}")
+    print(f"got: {bm.get_batch()}")
+    print(f"got: {bm.get_batch()}")
+    print(f"got: {bm.get_batch()}")
+    print(f"got: {bm.get_batch()}")
 
-    bm = BucketManager("resolutions.pkl", bsz=8, world_size=1, global_rank=0, valid_ids=ids[0:16])
+    bm = BucketManager(
+        "resolutions.pkl", bsz=8, world_size=1, global_rank=0, valid_ids=ids[0:16]
+    )
     for _ in range(16):
         bm.get_batch()
     print("got from future epoch: " + str(bm.get_batch()))
@@ -372,7 +438,7 @@ if __name__ == "__main__":
             first = True
             for ids, res in bm.generator():
                 if first and i == 0:
-                    #print(ids)
+                    # print(ids)
                     first = False
                 for post_id in ids:
                     counts[id_map[post_id]] += 1

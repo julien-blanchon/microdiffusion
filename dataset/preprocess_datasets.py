@@ -1,38 +1,64 @@
-import torch.multiprocessing as mp
+from torch.multiprocessing.spawn import spawn
 from torch.distributed import init_process_group, destroy_process_group
 import torch
+from torch.amp.autocast_mode import autocast
 import os
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 import numpy as np
 from PIL import Image
 from torchvision import transforms
-from diffusers import AutoencoderKL
-from open_clip import create_model_from_pretrained, get_tokenizer # works on open-clip-torch>=2.23.0, timm>=0.9.8
-import torch.nn.functional as F
-import numpy as np
-import pickle
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+from open_clip import (
+    create_model_from_pretrained,
+    get_tokenizer,
+)  # works on open-clip-torch>=2.23.0, timm>=0.9.8
 import time
 from huggingface_hub import HfApi
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from PIL import Image
 import json
-from config import (USERNAME, DATASET_NAME, METADATA_DATASET_NAME, IMG_COLUMN_NAME, IMAGE_ID_COLUMN_NAME, PREPROCESS_BS_PER_GPU, IMAGES_PER_PARQUET,
-DS_DIR_BASE, MODELS_DIR_BASE, VAE_HF_NAME, SIGLIP_HF_NAME, MP_BACKEND)
+from config import (
+    USERNAME,
+    DATASET_NAME,
+    METADATA_DATASET_NAME,
+    IMG_COLUMN_NAME,
+    IMAGE_ID_COLUMN_NAME,
+    PREPROCESS_BS_PER_GPU,
+    IMAGES_PER_PARQUET,
+    DS_DIR_BASE,
+    MODELS_DIR_BASE,
+    VAE_HF_NAME,
+    SIGLIP_HF_NAME,
+    MP_BACKEND,
+)
+
 
 def get_prng(seed):
     return np.random.RandomState(seed)
 
+
 class BucketManager:
-    def __init__(self, max_size=(512,512), divisible=16, min_dim=256, base_res=(512,512), bsz=64, world_size=1, global_rank=0, max_ar_error=4, seed=42, dim_limit=1024, debug=False):
+    def __init__(
+        self,
+        max_size=(512, 512),
+        divisible=16,
+        min_dim=256,
+        base_res=(512, 512),
+        bsz=64,
+        world_size=1,
+        global_rank=0,
+        max_ar_error=4,
+        seed=42,
+        dim_limit=1024,
+        debug=False,
+    ):
         self.max_size = max_size
         self.f = 8
-        self.max_tokens = (max_size[0]/self.f) * (max_size[1]/self.f)
+        self.max_tokens = (max_size[0] / self.f) * (max_size[1] / self.f)
         self.div = divisible
         self.min_dim = min_dim
         self.dim_limit = dim_limit
@@ -42,8 +68,10 @@ class BucketManager:
         self.global_rank = global_rank
         self.max_ar_error = max_ar_error
         self.prng = get_prng(seed)
-        epoch_seed = self.prng.tomaxint() % (2**32-1)
-        self.epoch_prng = get_prng(epoch_seed) # separate prng for sharding use for increased thread resilience
+        epoch_seed = self.prng.tomaxint() % (2**32 - 1)
+        self.epoch_prng = get_prng(
+            epoch_seed
+        )  # separate prng for sharding use for increased thread resilience
         self.epoch = None
         self.left_over = None
         self.batch_total = None
@@ -59,10 +87,14 @@ class BucketManager:
         resolutions = []
         aspects = []
         w = self.min_dim
-        while (w/self.f) * (self.min_dim/self.f) <= self.max_tokens and w <= self.dim_limit:
+        while (w / self.f) * (
+            self.min_dim / self.f
+        ) <= self.max_tokens and w <= self.dim_limit:
             h = self.min_dim
             got_base = False
-            while (w/self.f) * ((h+self.div)/self.f) <= self.max_tokens and (h+self.div) <= self.dim_limit:
+            while (w / self.f) * ((h + self.div) / self.f) <= self.max_tokens and (
+                h + self.div
+            ) <= self.dim_limit:
                 if w == self.base_res[0] and h == self.base_res[1]:
                     got_base = True
                 h += self.div
@@ -70,18 +102,22 @@ class BucketManager:
                 resolutions.append(self.base_res)
                 aspects.append(1)
             resolutions.append((w, h))
-            aspects.append(float(w)/float(h))
+            aspects.append(float(w) / float(h))
             w += self.div
         h = self.min_dim
-        while (h/self.f) * (self.min_dim/self.f) <= self.max_tokens and h <= self.dim_limit:
+        while (h / self.f) * (
+            self.min_dim / self.f
+        ) <= self.max_tokens and h <= self.dim_limit:
             w = self.min_dim
             got_base = False
-            while (h/self.f) * ((w+self.div)/self.f) <= self.max_tokens and (w+self.div) <= self.dim_limit:
+            while (h / self.f) * ((w + self.div) / self.f) <= self.max_tokens and (
+                w + self.div
+            ) <= self.dim_limit:
                 if w == self.base_res[0] and h == self.base_res[1]:
                     got_base = True
                 w += self.div
             resolutions.append((w, h))
-            aspects.append(float(w)/float(h))
+            aspects.append(float(w) / float(h))
             h += self.div
         res_map = {}
         for i, res in enumerate(resolutions):
@@ -97,9 +133,10 @@ class BucketManager:
 
     def get_ideal_resolution(self, image_size) -> tuple[int, int]:
         w, h = image_size
-        aspect = float(w)/float(h)
+        aspect = float(w) / float(h)
         bucket_id = np.abs(np.log(self.aspects) - np.log(aspect)).argmin()
         return self.resolutions[bucket_id]
+
 
 def resize_and_crop(image, target_size):
     # image: PIL Image
@@ -127,17 +164,23 @@ def resize_and_crop(image, target_size):
         image = image.crop((left, upper, left + target_w, upper + target_h))
     return image
 
+
 def preprocess_image(image):
     # Ensure image is in RGB format
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
+    if image.mode != "RGB":
+        image = image.convert("RGB")
     # Convert to tensor, normalize
-    transform = transforms.Compose([
-        transforms.ToTensor(),  # Converts to [0,1], shape (C,H,W)
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])  # Normalize to [-1,1]
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),  # Converts to [0,1], shape (C,H,W)
+            transforms.Normalize(
+                [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+            ),  # Normalize to [-1,1]
+        ]
+    )
     image_tensor = transform(image)
     return image_tensor
+
 
 def ddp_setup(rank: int, world_size: int):
     """
@@ -150,14 +193,34 @@ def ddp_setup(rank: int, world_size: int):
     os.environ["MASTER_ADDR"] = addr
     os.environ["MASTER_PORT"] = port
 
-    init_process_group(backend=f"{MP_BACKEND}", rank=rank, world_size=world_size, init_method=f"tcp://{addr}:{port}?use_libuv=0")
+    init_process_group(
+        backend=f"{MP_BACKEND}",
+        rank=rank,
+        world_size=world_size,
+        init_method=f"tcp://{addr}:{port}?use_libuv=0",
+    )
 
-def calculate_latents_and_embeddings(batch, vae, siglip_model, siglip_tokenizer, device, bucket_manager, moondream_model, moondream_tokenizer):
+
+def calculate_latents_and_embeddings(
+    batch,
+    vae,
+    siglip_model,
+    siglip_tokenizer,
+    device,
+    bucket_manager,
+    moondream_model,
+    moondream_tokenizer,
+):
     """Function to calculate latents and embeddings for a given image."""
     images = batch[IMG_COLUMN_NAME]
     keys = batch[IMAGE_ID_COLUMN_NAME]
-    target_resolutions = [bucket_manager.get_ideal_resolution(image.size) for image in images]
-    resized_images = [resize_and_crop(image, target_res) for image, target_res in zip(images, target_resolutions)]
+    target_resolutions = [
+        bucket_manager.get_ideal_resolution(image.size) for image in images
+    ]
+    resized_images = [
+        resize_and_crop(image, target_res)
+        for image, target_res in zip(images, target_resolutions)
+    ]
 
     # Can only batch process in VAE if resolutions are same, queue the same resolutions
     queue = {}
@@ -195,49 +258,67 @@ def calculate_latents_and_embeddings(batch, vae, siglip_model, siglip_tokenizer,
     latents = [res_latents[key] for key in keys]
     captions = [res_captions[key] for key in keys]
 
-    texts = siglip_tokenizer(captions, context_length=siglip_model.context_length).to(device)
+    texts = siglip_tokenizer(captions, context_length=siglip_model.context_length).to(
+        device
+    )
     text_embeddings = siglip_model.encode_text(texts)
 
     return latents, text_embeddings.cpu(), captions
 
+
 def create_schema():
     """Create schemas for latents and embeddings parquet tables."""
-    latents_schema = pa.schema([
-        ('image_id', pa.string()),
-        ('latent', pa.list_(pa.float32())),
-        ('latent_shape', pa.list_(pa.int64())),
-        ('embedding', pa.list_(pa.float32())),
-        ('caption', pa.string())
-    ])
+    latents_schema = pa.schema(
+        [
+            ("image_id", pa.string()),
+            ("latent", pa.list_(pa.float32())),
+            ("latent_shape", pa.list_(pa.int64())),
+            ("embedding", pa.list_(pa.float32())),
+            ("caption", pa.string()),
+        ]
+    )
     return latents_schema
+
 
 def write_parquet(latents_list, latents_parquet_file, latents_schema):
     """Write latents and embeddings data into parquet files."""
-    latents_table = pa.Table.from_pydict({
-        'image_id': [item['image_id'] for item in latents_list],
-        'latent': [item['latent'] for item in latents_list],
-        'latent_shape': [item['latent_shape'] for item in latents_list],
-        'embedding': [item['embedding'] for item in latents_list],
-        'caption': [item['caption'] for item in latents_list]
-    }, schema=latents_schema)
+    latents_table = pa.Table.from_pydict(
+        {
+            "image_id": [item["image_id"] for item in latents_list],
+            "latent": [item["latent"] for item in latents_list],
+            "latent_shape": [item["latent_shape"] for item in latents_list],
+            "embedding": [item["embedding"] for item in latents_list],
+            "caption": [item["caption"] for item in latents_list],
+        },
+        schema=latents_schema,
+    )
 
     pq.write_table(latents_table, latents_parquet_file)
 
 
-def process_images(rank: int, world_size: int, dataset, vae, siglip_model, tokenizer, bucket_manager):
+def process_images(
+    rank: int, world_size: int, dataset, vae, siglip_model, tokenizer, bucket_manager
+):
     ddp_setup(rank, world_size)
-    dataset = split_dataset_by_node(dataset, rank, world_size).batch(PREPROCESS_BS_PER_GPU)
+    dataset = split_dataset_by_node(dataset, rank, world_size).batch(
+        PREPROCESS_BS_PER_GPU
+    )
 
-    device = torch.device(f'cuda:{rank}')
+    device = torch.device(f"cuda:{rank}")
     vae = torch.compile(vae.to(device))
     siglip_model = torch.compile(siglip_model.to(device))
 
     model_id = "vikhyatk/moondream2"
     revision = "2024-07-23"
     moondream_model = AutoModelForCausalLM.from_pretrained(
-        model_id, trust_remote_code=True, revision=revision, cache_dir=f"{MODELS_DIR_BASE}/moondream"
+        model_id,
+        trust_remote_code=True,
+        revision=revision,
+        cache_dir=f"{MODELS_DIR_BASE}/moondream",
     )
-    moondream_tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, cache_dir=f"{MODELS_DIR_BASE}/moondream")
+    moondream_tokenizer = AutoTokenizer.from_pretrained(
+        model_id, revision=revision, cache_dir=f"{MODELS_DIR_BASE}/moondream"
+    )
 
     moondream_model = torch.compile(moondream_model.to(device))
 
@@ -245,7 +326,9 @@ def process_images(rank: int, world_size: int, dataset, vae, siglip_model, token
     image_id_caption_map = {}
     latents_list = []
 
-    executor = ThreadPoolExecutor(max_workers=8)  # Adjust the number of threads as needed
+    executor = ThreadPoolExecutor(
+        max_workers=8
+    )  # Adjust the number of threads as needed
     latents_schema = create_schema()
 
     # Create directories if they don't exist
@@ -253,31 +336,52 @@ def process_images(rank: int, world_size: int, dataset, vae, siglip_model, token
     os.makedirs(latents_dir, exist_ok=True)
     index = 0
 
-    with torch.no_grad(), torch.amp.autocast(device_type="cuda"):
-        progress_bar = tqdm(desc=f"Approximate processed", unit="img") if rank == 0 else None
+    with torch.no_grad(), autocast(device_type="cuda"):
+        progress_bar = (
+            tqdm(desc="Approximate processed", unit="img") if rank == 0 else None
+        )
         for i, batch in enumerate(dataset):
             # Calculate latents and embeddings
-            latents, text_embeddings, captions = calculate_latents_and_embeddings(batch, vae, siglip_model, tokenizer, device, bucket_manager, moondream_model, moondream_tokenizer)
+            latents, text_embeddings, captions = calculate_latents_and_embeddings(
+                batch,
+                vae,
+                siglip_model,
+                tokenizer,
+                device,
+                bucket_manager,
+                moondream_model,
+                moondream_tokenizer,
+            )
             image_ids = batch[IMAGE_ID_COLUMN_NAME]
-            assert len(latents) == PREPROCESS_BS_PER_GPU, f"Latents length mismatch: {len(latents)} != {PREPROCESS_BS_PER_GPU}"
-            assert len(text_embeddings) == PREPROCESS_BS_PER_GPU, f"Text embeddings length mismatch: {len(text_embeddings)} != {PREPROCESS_BS_PER_GPU}"
-            assert len(captions) == PREPROCESS_BS_PER_GPU, f"Captions length mismatch: {len(captions)} != {PREPROCESS_BS_PER_GPU}"
+            assert (
+                len(latents) == PREPROCESS_BS_PER_GPU
+            ), f"Latents length mismatch: {len(latents)} != {PREPROCESS_BS_PER_GPU}"
+            assert (
+                len(text_embeddings) == PREPROCESS_BS_PER_GPU
+            ), f"Text embeddings length mismatch: {len(text_embeddings)} != {PREPROCESS_BS_PER_GPU}"
+            assert (
+                len(captions) == PREPROCESS_BS_PER_GPU
+            ), f"Captions length mismatch: {len(captions)} != {PREPROCESS_BS_PER_GPU}"
 
-            for image_id, latent, text_embedding, caption in zip(image_ids, latents, text_embeddings, captions):
+            for image_id, latent, text_embedding, caption in zip(
+                image_ids, latents, text_embeddings, captions
+            ):
                 image_id_res_map[image_id] = latent.shape[1:]
                 image_id_caption_map[image_id] = caption
 
                 # Append to the lists
-                latents_list.append({
-                    'image_id': str(image_id),
-                    'latent': latent.numpy().flatten().tolist(),
-                    'latent_shape': list(latent.shape),
-                    'embedding': text_embedding.numpy().flatten().tolist(),
-                    'caption': caption
-                })
+                latents_list.append(
+                    {
+                        "image_id": str(image_id),
+                        "latent": latent.numpy().flatten().tolist(),
+                        "latent_shape": list(latent.shape),
+                        "embedding": text_embedding.numpy().flatten().tolist(),
+                        "caption": caption,
+                    }
+                )
 
             # Write Parquet files after reaching the IMAGES_PER_PARQUET threshold
-            if (i + 1) % (IMAGES_PER_PARQUET//PREPROCESS_BS_PER_GPU) == 0:
+            if (i + 1) % (IMAGES_PER_PARQUET // PREPROCESS_BS_PER_GPU) == 0:
                 latents_parquet_file = f"{latents_dir}/{index}_latents.parquet"
 
                 write_parquet(latents_list, latents_parquet_file, latents_schema)
@@ -313,6 +417,7 @@ def process_images(rank: int, world_size: int, dataset, vae, siglip_model, token
 
     destroy_process_group()
 
+
 def merge_res_and_caption_maps(filepath, world_size, api):
     """
     Merges the all the ranks' res_maps to a single file, and the all the ranks' captions to another single file.
@@ -333,36 +438,66 @@ def merge_res_and_caption_maps(filepath, world_size, api):
     # Upload res and caption maps
     api.upload_file(
         path_or_fileobj=f"{filepath}/res_map.json",
-        path_in_repo=f"res_map.json",
+        path_in_repo="res_map.json",
         repo_id=f"{USERNAME}/{METADATA_DATASET_NAME}",
         repo_type="dataset",
     )
     api.upload_file(
         path_or_fileobj=f"{filepath}/captions.json",
-        path_in_repo=f"captions.json",
+        path_in_repo="captions.json",
         repo_id=f"{USERNAME}/{METADATA_DATASET_NAME}",
         repo_type="dataset",
     )
+
 
 def preprocess_datasets_main(test=False):
     world_size = torch.cuda.device_count()
 
     if test:
-        dataset = load_dataset("common-canvas/commoncatalog-cc-by", split="train", streaming=True, columns=["key", "jpg"], data_dir="0/least_dim_range=512-768", cache_dir=f"{DS_DIR_BASE}/commoncatalog_cc_by").take(1000)
+        dataset = load_dataset(
+            "common-canvas/commoncatalog-cc-by",
+            split="train",
+            streaming=True,
+            columns=["key", "jpg"],
+            data_dir="0/least_dim_range=512-768",
+            cache_dir=f"{DS_DIR_BASE}/commoncatalog_cc_by",
+        ).take(1000)
     else:
-        dataset = load_dataset("common-canvas/commoncatalog-cc-by", split="train", columns=["key", "jpg"], cache_dir=f"{DS_DIR_BASE}/commoncatalog_cc_by")
+        dataset = load_dataset(
+            "common-canvas/commoncatalog-cc-by",
+            split="train",
+            columns=["key", "jpg"],
+            cache_dir=f"{DS_DIR_BASE}/commoncatalog_cc_by",
+        )
 
-    vae = AutoencoderKL.from_pretrained(f"{VAE_HF_NAME}", cache_dir=f"{MODELS_DIR_BASE}/vae")
-    siglip_model, preprocess = create_model_from_pretrained(f'{SIGLIP_HF_NAME}', cache_dir=f"{MODELS_DIR_BASE}/siglip")
-    siglip_tokenizer = get_tokenizer(f'{SIGLIP_HF_NAME}', cache_dir=f"{MODELS_DIR_BASE}/siglip")
+    vae = AutoencoderKL.from_pretrained(
+        f"{VAE_HF_NAME}", cache_dir=f"{MODELS_DIR_BASE}/vae"
+    )
+    siglip_model, preprocess = create_model_from_pretrained(
+        f"{SIGLIP_HF_NAME}", cache_dir=f"{MODELS_DIR_BASE}/siglip"
+    )
+    siglip_tokenizer = get_tokenizer(
+        f"{SIGLIP_HF_NAME}", cache_dir=f"{MODELS_DIR_BASE}/siglip"
+    )
 
     bucket_manager = BucketManager()
     api = HfApi()
-    api.create_repo(repo_id=f"{USERNAME}/{METADATA_DATASET_NAME}", repo_type="dataset", exist_ok=True)
+    api.create_repo(
+        repo_id=f"{USERNAME}/{METADATA_DATASET_NAME}",
+        repo_type="dataset",
+        exist_ok=True,
+    )
 
-    mp.spawn(process_images, args=(world_size, dataset, vae, siglip_model, siglip_tokenizer, bucket_manager), nprocs=world_size)
+    spawn(
+        process_images,
+        args=(world_size, dataset, vae, siglip_model, siglip_tokenizer, bucket_manager),
+        nprocs=world_size,
+    )
 
-    merge_res_and_caption_maps(f"{DS_DIR_BASE}/{METADATA_DATASET_NAME}", world_size, api)
+    merge_res_and_caption_maps(
+        f"{DS_DIR_BASE}/{METADATA_DATASET_NAME}", world_size, api
+    )
+
 
 if __name__ == "__main__":
     preprocess_datasets_main(test=True)

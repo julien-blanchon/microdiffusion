@@ -1,7 +1,9 @@
 import torch
-import torch.nn.functional as F
 
-def apply_mask_to_tensor(x, mask, patch_size):
+
+def apply_mask_to_tensor(
+    x: torch.Tensor, mask: torch.Tensor, patch_size: tuple[int, int]
+) -> torch.Tensor:
     """
     Applies a mask to a tensor. Turns the masked values to 0s.
 
@@ -18,7 +20,11 @@ def apply_mask_to_tensor(x, mask, patch_size):
     num_patches_w = w // patch_size[1]
 
     # Ensure that height and width are divisible by patch_size
-    assert h % patch_size[0] == 0 and w % patch_size[1] == 0, "Height and width must be divisible by patch_size. Height: {}, Width: {}, Patch size: {}".format(h, w, patch_size)
+    assert (
+        h % patch_size[0] == 0 and w % patch_size[1] == 0
+    ), "Height and width must be divisible by patch_size. Height: {}, Width: {}, Patch size: {}".format(
+        h, w, patch_size
+    )
 
     # Reshape mask to (bs, num_patches_h, num_patches_w)
     mask = mask.view(bs, num_patches_h, num_patches_w)
@@ -34,7 +40,10 @@ def apply_mask_to_tensor(x, mask, patch_size):
 
     return x
 
-def unpatchify(x, patch_size, height, width):
+
+def unpatchify(
+    x: torch.Tensor, patch_size: tuple[int, int], height: int, width: int
+) -> torch.Tensor:
     """
     Reconstructs images from patches.
 
@@ -56,7 +65,9 @@ def unpatchify(x, patch_size, height, width):
     num_patches_w = width // W
 
     # Ensure num_patches equals num_patches_h * num_patches_w
-    assert num_patches == num_patches_h * num_patches_w, "Mismatch in number of patches."
+    assert (
+        num_patches == num_patches_h * num_patches_w
+    ), "Mismatch in number of patches."
 
     # Reshape x to (bs, num_patches_h, num_patches_w, H, W, in_channels)
     x = x.view(bs, num_patches_h, num_patches_w, H, W, in_channels)
@@ -72,7 +83,10 @@ def unpatchify(x, patch_size, height, width):
 
     return reconstructed
 
-def random_mask(bs: int, height: int, width: int, patch_size: tuple[int, int], mask_ratio: float) -> torch.Tensor:
+
+def random_mask(
+    bs: int, height: int, width: int, patch_size: tuple[int, int], mask_ratio: float
+) -> torch.Tensor:
     """
     Generates a random mask for patched images. Randomly selects patches to mask.
 
@@ -88,25 +102,26 @@ def random_mask(bs: int, height: int, width: int, patch_size: tuple[int, int], m
     """
     num_patches = (height // patch_size[0]) * (width // patch_size[1])
     num_patches_to_mask = int(num_patches * mask_ratio)
-    
+
     # Create a tensor of random values
     rand_tensor = torch.rand(bs, num_patches)
-    
+
     # Sort the random tensor and get the indices
     _, indices = torch.sort(rand_tensor, dim=1)
-    
+
     # Create a mask tensor initialized with ones
     mask = torch.ones(bs, num_patches)
-    
+
     # Set the first num_patches_to_mask indices to 0 for each batch
     mask[torch.arange(bs).unsqueeze(1), indices[:, :num_patches_to_mask]] = 0
-    
+
     # Ensure the final shape is (bs, num_patches)
     mask = mask.view(bs, num_patches)
 
     return mask
 
-def remove_masked_patches(patches, mask):
+
+def remove_masked_patches(patches: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     Removes the masked patches from the patches tensor while preserving batch dimensions.
     Returned tensor will have shape (bs, number_of_unmasked_patches, embed_dim).
@@ -126,7 +141,8 @@ def remove_masked_patches(patches, mask):
 
     return unmasked_patches
 
-def add_masked_patches(patches, mask):
+
+def add_masked_patches(patches: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     Adds the masked patches to the patches tensor.
     Returned tensor will have shape (bs, num_patches, embed_dim).
@@ -139,7 +155,9 @@ def add_masked_patches(patches, mask):
     bs, num_patches, embed_dim = mask.shape[0], mask.shape[1], patches.shape[-1]
 
     # Create a tensor of zeros with the same shape and dtype as the patches tensor
-    full_patches = torch.zeros(bs, num_patches, embed_dim, device=patches.device, dtype=patches.dtype)
+    full_patches = torch.zeros(
+        bs, num_patches, embed_dim, device=patches.device, dtype=patches.dtype
+    )
 
     # Iterate over each batch and place unmasked patches back in their original positions
     for i in range(bs):
